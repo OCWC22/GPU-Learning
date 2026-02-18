@@ -420,7 +420,7 @@ tiny-gpu has **GDS files** in the repo (`gds/0/gpu.gds`, `gds/1/gpu.gds`). GDS (
 For comparison:
 - tiny-gpu GDS: **130nm** process, probably a few thousand transistors
 - Snapdragon 8 Elite (Adreno 830): **3nm** process, ~20 billion transistors
-- NVIDIA B200: **4nm** process, ~208 billion transistors
+- NVIDIA B200: **4nm (TSMC 4NP)** process, ~208 billion transistors
 
 ### What the ALU Becomes in Silicon
 
@@ -1844,7 +1844,7 @@ The GPU is just **one block** on this chip. It shares the memory controller with
 | **Memory** | Shared LPDDR5X (12 GB) | HBM3e (192 GB per GPU) |
 | **Bandwidth** | ~84.8 GB/s shared | ~8 TB/s per GPU |
 | **Compute** | 3.7 TFLOPS (GPU) + 75 TOPS (NPU) | 2,000+ TFLOPS (FP32) |
-| **On-die cache** | 44+ MB total | 50+ MB per GPU |
+| **On-die cache** | 44+ MB total | ~126–192 MB per GPU |
 | **CPU+GPU latency** | ~0 (same die) | ~10-100 μs (PCIe) |
 | **Data movement** | No DMA copy needed | Host ↔ Device DMA overhead |
 | **Scalability** | Single chip, up to 16GB | 8-16 GPUs per node |
@@ -3770,8 +3770,8 @@ For 70B model at FP4:
 NVIDIA B200:
 ┌─────────────────────────────────────────────────────────────┐
 │  Peak compute (precision-dependent):                        │
-│    TF32:  ~2,200 TOPS  (HGX B200, confirmed spec)          │
-│    FP8:   ~4,500 TOPS dense  (HGX B200)                    │
+│    TF32:  ~2,250 TOPS sparse / ~1,250 TOPS dense (B200)    │
+│    FP8:   ~4,500 TOPS dense  (B200)                        │
 │    FP4:   ~9,000 TOPS dense  (with Transformer Engine)     │
 │  HBM3e:   7.7 TB/s (HGX B200) / 8.0 TB/s (full B200)     │
 │                                                             │
@@ -3779,7 +3779,7 @@ NVIDIA B200:
 │    Decode  (AI ≈ 1–4 ops/byte):  wide range >> HBM         │
 │    Prefill FP8 (AI ≈ 500+):      may approach HBM capacity  │
 │                                                             │
-│  AI knee (TF32, HGX B200): 2,200 TOPS ÷ 7,700 GB/s ≈ 286 ops/byte │
+│  AI knee (TF32, B200): 2,250 TOPS ÷ 7,700 GB/s ≈ 292 ops/byte │
 │  AI knee (FP8, B200):      4,500 TOPS ÷ 7,700 GB/s ≈ 584 ops/byte │
 │  → "compute-limited" threshold depends on precision mode    │
 │                                                             │
@@ -3789,8 +3789,8 @@ NVIDIA B200:
 HBM's 100× bandwidth advantage means B200 can approach compute-limited
 behavior in large-batch prefill. The AI knee depends on precision mode
 and platform:
-  HGX B200 TF32:  ~2,200 TOPS ÷ 7,700 GB/s  ≈ 286 ops/byte
-  HGX B200 FP8:   ~4,500 TOPS ÷ 7,700 GB/s  ≈ 584 ops/byte
+  B200 TF32 sparse:  ~2,250 TOPS ÷ 7,700 GB/s  ≈ 292 ops/byte
+  B200 FP8 dense:  ~4,500 TOPS ÷ 7,700 GB/s  ≈ 584 ops/byte
   (Full B200 at 8 TB/s shifts these by ~4%)
 These are theoretical roofline knees; real kernels reach them only in
 large-batch, well-tiled GEMMs — not on full transformer graphs.
@@ -3823,7 +3823,7 @@ On-package Memory    │  12 GB LPDDR5X       │  192 GB HBM3e        │
 Transistors          │  ~20B                │  ~208B               │
                        │  ██                  │  ████████████████████│
 ─────────────────────────┼──────────────────────┼──────────────────────┤
-Process Node         │  3nm (TSMC N3E)      │  4nm (TSMC N4)       │
+Process Node         │  3nm (TSMC N3E)      │  4nm (TSMC 4NP)      │
                        │  similar ─────────────────────── similar   │
 ─────────────────────────┴──────────────────────┴──────────────────────┘
 Both platforms: more compute than memory bandwidth can feed.
@@ -3910,7 +3910,7 @@ WHAT WE KNOW (from physics + public specs):
   - Streaming all weights per token at 70 tok/s would require ~245 GB/s
   - 245 > 84.8 → something else is going on
   - On-chip SRAM (known): 44+ MB across CPU/GPU/SLC
-  - NPU rated at ~75 TOPS INT8
+  - NPU rated at ~75 TOPS INT8 [est.]
 
 WHAT WE KNOW from Qualcomm's descriptions:
   - Fused scalar/vector/tensor architecture with shared on-chip memory
@@ -4750,14 +4750,14 @@ Academic microbenchmark work on Blackwell explicitly calls out TMEM, the decompr
 
 | Metric | tiny-gpu | Snapdragon 8 Elite | NVIDIA B200 |
 |--------|----------|-------------------|-------------|
-| Process | 130nm | 3nm (TSMC N3E) | 4nm (TSMC N4) |
+| Process | 130nm | 3nm (TSMC N3E) | 4nm (TSMC 4NP) |
 | Transistors | ~100K | ~20 billion | ~208 billion |
-| Compute cores | 2 | 12 CUs | 192 SMs |
+| Compute cores | 2 | 12 CUs | 148 SMs (74/die × 2 dies) |
 | Threads | 8 | Millions | Millions |
 | ALU precision | 8-bit | FP32/FP16/INT8/INT4 | FP64/FP32/FP16/FP8/FP4 |
 | Memory | 256 bytes | 12 GB LPDDR5X | 192 GB HBM3e |
 | Bandwidth | ~32 bits/cycle | ~84.8 GB/s | ~8 TB/s |
-| Cache | None | 44+ MB on-die | ~50+ MB |
+| Cache | None | 44+ MB on-die | ~126–192 MB per GPU |
 | Power | N/A | ~5W sustained | ~1000W TDP |
 | Instructions | 11 | Thousands | Thousands |
 | Latency hiding | None (stall) | Wave scheduling | Warp scheduling |
@@ -4798,7 +4798,7 @@ UBWC v6 bandwidth compression
 
 ```
 8 scalar cores + 6 vector cores (HVX, 1024-bit SIMD) + Tensor Accelerator
-~75 TOPS INT8, ~150 TOPS INT4
+~75 TOPS INT8 [est.], ~150 TOPS INT4 [est.]
 INT2/4/8/16, FP8/16, mixed precision
 Tensor accelerator: independent power rail, DVFS
 Micro Tile Inferencing
@@ -5409,10 +5409,10 @@ Here's how every module in tiny-gpu maps to real hardware, with the core insight
 │  (one req at a time)    │  (prefetch + double buffer) │  (thousands in flight/SM)     │
 ├─────────────────────────┼────────────────────────────┼────────────────────────────────┤
 │  alu.sv                 │  Hexagon NPU systolic MAC  │  Tensor cores (FP4/FP8)        │
-│  (1 op, cheap)          │  (~75 TOPS INT8)           │  (~2,500 TOPS FP8)             │
+│  (1 op, cheap)          │  (~75 TOPS INT8 [est.])    │  (~4,500 TOPS FP8 dense)       │
 ├─────────────────────────┼────────────────────────────┼────────────────────────────────┤
 │  registers.sv           │  Register file + NPU       │  256 KB register file / SM     │
-│  (128 bytes total)      │  shared scratchpad         │  (~49 MB across all SMs)       │
+│  (128 bytes total)      │  shared scratchpad         │  (~38 MB across all SMs)       │
 └─────────────────────────┴────────────────────────────┴────────────────────────────────┘
 
 Core insight running through every row:
