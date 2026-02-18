@@ -1133,9 +1133,11 @@ Same instruction, different thread-local register → different result!
 ### Register File Comparison
 
 ```
-tiny-gpu:     64 bytes per core
-Snapdragon:   7.8 MB per GPU (656 KB per CU × 12 CUs)
-Ratio:        122,000× larger!
+tiny-gpu:     64 bytes per core (exactly known; it's in the RTL)
+Snapdragon:   ~7.8 MB per GPU (rough estimate: ~650 KB per CU × 12 CUs)
+              [⚠ SPECULATIVE: Qualcomm has not publicly confirmed register file sizes.
+               This is derived from wave count × register file per wave assumptions.]
+Ratio:        ~120,000× larger (approximate)
 
 Why? Snapdragon keeps 40 waves resident simultaneously.
 ```
@@ -2335,8 +2337,12 @@ Example: Load A[i] from address 0:
              ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │              LPDDR5X DRAM — 4 channels, ~84.8 GB/s                      │
-│  • ~100-150 nanoseconds latency                                         │
-│  • ~100-150 cycles at 1.2 GHz GPU clock                                │
+│  • Latency: 60–200+ ns depending on access pattern:                    │
+│      Page hit (tCL + tRCD ≈ 18ns each): ~60–80 ns                     │
+│      Page miss (add tRP precharge):      ~80–120 ns                    │
+│      Rank switching:                     ~120–200+ ns                  │
+│      Plus QoS arbitration: if CPU is bursting, NPU waits               │
+│  • At 1.2 GHz GPU clock: ~72–240+ cycles                              │
 │  This is PAINFUL but unavoidable for weights not in on-chip memory      │
 └─────────────────────────────────────────────────────────────────────────┘
 
@@ -3260,20 +3266,24 @@ When you run an LLM on the Snapdragon 8 Elite at 70+ tokens/second, every optimi
 
 ```
 Model: 7 billion parameters × 0.5 bytes = 3.5 GB weights
-Snapdragon bandwidth: 84.8 GB/s
+Snapdragon theoretical bandwidth: 76.8 GB/s (Qualcomm spec: ~84.8 GB/s)
+NPU-available after SoC contention: ~65 GB/s
 
-Naive calculation: 84.8 / 3.5 = 24 tok/sec (hard cap from physics)
+Conservative ceiling: 65 / 3.5 ≈ 19 tok/sec (no weight reuse)
+Theoretical max:      76.8 / 3.5 ≈ 22 tok/sec
 
 Qualcomm claims 70+ tok/sec. How?
 
-Answer: Five simultaneous optimizations
+Answer: Multiple simultaneous optimizations + favorable conditions
 
-1. COALESCING: 8 requests → 1 transaction (25% bandwidth savings)
-   Effect: +25% throughput = 30 tok/sec
+1. COALESCING: 8 requests → 1 transaction (reduces overhead)
+   Effect: efficiency improvement but doesn't break bandwidth ceiling
 
-2. CACHING: 44 MB on-chip SRAM holds 1B+ params at INT4
-   Repeated access hits cache (25-100× faster)
-   Effect: +100% throughput = 60 tok/sec
+2. CACHING: 44 MB on-chip SRAM holds ~88M params at INT4 (not 1B+)
+   [44 MB ÷ 0.5 bytes/param = 88M params = 1.3% of 7B model]
+   Effective for: KV cache, hot activations, embedding rows
+   NOT effective for: bulk weight streaming (3.5 GB >> 44 MB)
+   Effect: modest improvement for activation traffic
 
 3. WAVE SCHEDULING: 40+ waves per CU = 6,400 threads in-flight
    Latency hidden behind parallel execution
@@ -3305,10 +3315,15 @@ Let's start with what we **actually know:**
 
 ```
 Snapdragon 8 Elite LPDDR5X:
-  4 channels × 16-bit × 9600 MT/s = 76.8 GB/s raw (84.8 GB/s spec)
+  4 channels × 16-bit × 9600 MT/s / 8 bits per byte = 76.8 GB/s (theoretical peak)
+  Qualcomm published spec: ~84.8 GB/s (higher-binned die or boosted MT/s bin)
 
-  This is a HARD ceiling. No software trick changes this number.
-  Every byte of weight data that isn't cached must come through this pipe.
+  IMPORTANT: This 76.8–84.8 GB/s is the SoC-level total, shared by:
+    CPU (Oryon cores), GPU (Adreno 830), NPU (Hexagon), ISP, display, modem
+  NPU-available bandwidth in practice: ~50–70 GB/s (after OS/display/ISP overhead)
+
+  This is the physical ceiling for the SoC. No software changes this number.
+  Every byte of weight data that isn't cached must come through this shared pipe.
 ```
 
 Now let's think about what LLM inference requires. A 7B parameter model quantized to INT4:
@@ -3634,15 +3649,16 @@ tokens/sec ≤ DRAM_bandwidth ÷ bytes_of_weights_per_token
 
 ┌─────────────────────────── Snapdragon 8 Elite ─────────────────────────────┐
 │                                                                             │
-│  LPDDR5X: 4 channels × 16-bit × 9600 MT/s ≈ 84.8 GB/s                    │
+│  LPDDR5X: 4ch × 16-bit × 9600 MT/s = 76.8 GB/s theoretical peak           │
+│           Qualcomm spec: ~84.8 GB/s; NPU share: ~50–70 GB/s in practice    │
 │                                                                             │
-│  Model     Precision   Weight bytes   Ceiling (tok/s)                      │
+│  Model     Precision   Weight bytes   Ceiling (tok/s)   [full BW; no reuse]│
 │  ────────  ─────────   ────────────   ───────────────                      │
-│  7B param  INT4        3.5  GB        84.8 / 3.5  ≈  24  ← hard cap       │
-│  3B param  INT4        1.5  GB        84.8 / 1.5  ≈  57                   │
-│  1B param  INT4        0.5  GB        84.8 / 0.5  ≈ 170                   │
+│  7B param  INT4        3.5  GB        76.8 / 3.5  ≈  22  (theoretical max) │
+│  3B param  INT4        1.5  GB        76.8 / 1.5  ≈  51                   │
+│  1B param  INT4        0.5  GB        76.8 / 0.5  ≈ 154                   │
 │                                                                             │
-│  "70+ tok/s" claims require: small model (≤3B), caching, or prefill burst  │
+│  "70+ tok/s" requires: small model (≤3B), weight reuse, or prefill burst   │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────── NVIDIA B200 ────────────────────────────────────┐
@@ -3667,12 +3683,21 @@ B200        │█████████████████████�
 For a 7B parameter model at INT4:
 
 ```
-Weight payload: 7 × 10⁹ × 0.5 bytes = 3.5 GB
+Weight payload: 7 × 10⁹ × 0.5 bytes = 3.5 GB per token (bytes loaded, not bytes/sec)
 
-If streaming all weights from DRAM per token:
-  tokens/sec ≤ 84.8 / 3.5 ≈ 24 tokens/sec
+If streaming all weights from DRAM per token (no reuse, full SoC bandwidth):
+  tokens/sec ≤ 76.8 GB/s ÷ 3.5 GB/token ≈ 22 tok/s (theoretical ceiling)
 
-This is a HARD CEILING from physics.
+Accounting for SoC contention (~65 GB/s NPU-available):
+  tokens/sec ≤ 65 / 3.5 ≈ 19 tok/s (more realistic ceiling)
+
+Accounting for weight reuse (reuse_factor r, 0 ≤ r < 1):
+  tokens/sec ≤ BW / (3.5 × (1 - r))
+  At r=0.10: ≤ 65 / 3.15 ≈ 21 tok/s
+  At r=0.50: ≤ 65 / 1.75 ≈ 37 tok/s  [requires significant on-chip SRAM hits]
+
+This is a physics ceiling for the no-reuse case. On-chip caching can raise it —
+but only for the fraction of weights that physically fit in SRAM (see §53.5).
 ```
 
 When Qualcomm claims "70+ tokens/second," the bandwidth math tells us one or more of the following must be true:
@@ -3701,28 +3726,41 @@ For 70B model at FP4:
 **Snapdragon Hexagon NPU:**
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Peak compute:     75 TOPS INT8                             │
-│  Required feed:    75 T ops/s × 1 byte/op = 150 TB/s       │
-│  DRAM provides:    ~0.085 TB/s                              │
-│  Gap:              150 / 0.085 ≈ 1,765×                    │
+│  Peak compute:              75 TOPS INT8                    │
+│                                                             │
+│  Required feed = compute / arithmetic_intensity (AI):       │
+│    required_BW = 75 TOPS ÷ AI                               │
+│                                                             │
+│  Decode  (batch=1, AI ≈ 1–4 FLOPS/byte):                  │
+│    75 TOPS ÷ 2 FLOPS/byte ≈ 37 TB/s >> DRAM (0.085 TB/s)  │
+│    Gap: 37 / 0.085 ≈ 435×  → severely bandwidth-bound      │
+│                                                             │
+│  Prefill (tiled GEMM, AI ≈ 100–500 FLOPS/byte):            │
+│    75 TOPS ÷ 300 FLOPS/byte ≈ 0.25 TB/s > DRAM            │
+│    Gap: 0.25 / 0.085 ≈ 3×  → approaching compute-limited   │
 │                                                             │
 │  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│ DRAM
-│  ████████████████████████████████████████████████████████████████████████████████████████ (×1,765 longer)│ Needed
+│  ██████████████████████████ (×435 in batch=1 decode)│ Needed│
 └─────────────────────────────────────────────────────────────┘
-→ On-chip tiling + reuse isn't an optimization — it's survival.
+→ Arithmetic intensity (AI) determines the gap, not a fixed multiplier.
+→ On-chip tiling raises AI — that's exactly why tiling is not optional.
 
 NVIDIA B200:
 ┌─────────────────────────────────────────────────────────────┐
-│  Peak compute:     ~2,500 TOPS FP8                          │
-│  Required feed:    ~2,500 TB/s                              │
-│  HBM3e provides:   ~8 TB/s                                  │
-│  Gap:              2,500 / 8 ≈ 312×                        │
+│  Peak compute:              ~2,500 TOPS FP8                 │
+│                                                             │
+│  Required feed = 2,500 TOPS ÷ AI:                          │
+│    Decode  (AI ≈ 1–4):  625–2,500 TB/s  >> HBM (8 TB/s)   │
+│    Prefill (AI ≈ 1000): 2.5 TB/s        <  HBM (8 TB/s) ✓ │
+│                                                             │
+│  Decode gap:    2,500 TB/s needed / 8 TB/s HBM = 312×      │
+│  Prefill gap:   2.5 TB/s needed / 8 TB/s HBM < 1× ← WIN   │
 │                                                             │
 │  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│ HBM
-│  ██████████████████████████████████████████████████████████████████████ (×312)│ Needed
+│  ████████████████████████████████████ (×312 in decode)│ Need│
 └─────────────────────────────────────────────────────────────┘
-HBM's 100× bandwidth advantage narrows the gap from 1,765× to 312×.
-Both still require massive on-chip reuse to reach peak utilization.
+HBM's 100× bandwidth advantage means B200 reaches compute-limited
+prefill at AI ≥ 312 FLOPS/byte. Both chips require on-chip reuse.
 ```
 
 ### Hardware Face-Off: Same Physics, Different Budgets
@@ -3793,7 +3831,8 @@ Multiple IP blocks compete for the same 4 LPDDR5X channels. Display (120 Hz dead
 
 ```
 WHAT WE KNOW (from physics + public specs):
-  - LPDDR5X bandwidth ceiling: ~84.8 GB/s
+  - LPDDR5X theoretical bandwidth: 76.8 GB/s (4ch × 16-bit × 9600 MT/s ÷ 8)
+    Qualcomm spec: ~84.8 GB/s; NPU-available after SoC contention: ~50–70 GB/s
   - 7B INT4 model weights: ~3.5 GB
   - Streaming all weights per token at 70 tok/s would require ~245 GB/s
   - 245 > 84.8 → something else is going on
@@ -3841,7 +3880,10 @@ Weight load for 6-token prefill on 7B model:
 Operational Intensity (FLOP/byte):
   matmul([batch=6, seq_len=1, dim=4096], [dim=4096, d_ff=11008])
   = 2 × 6 × 1 × 4096 × 11008 FLOPS ÷ (6 × 4096 × 4 bytes)
-  ≈ 2 × 11008 / 4 ≈ 5,500 FLOPS/byte ← COMPUTE-LIMITED!
+  ≈ 2 × 11008 / 4 ≈ 5,500 FLOPS/byte  ← compute-limited at this batch size
+  [NOTE: This 5,500 FLOPS/byte assumes batch=6 and ignores KV cache bandwidth.
+   Actual AI depends on seq_len, batch_size, hidden_dim, and SRAM reuse depth.
+   At batch=1, AI ≈ 1–4 FLOPS/byte (bandwidth-bound, like decode).]
 ```
 
 **Prefill can run at peak compute efficiency** because you're amortizing weights across multiple tokens. This is essentially a tiled matrix-matrix multiply (GEMM).
@@ -3886,15 +3928,21 @@ Operations ÷ Bytes:
 For decode, the ceiling is **hard physics**:
 
 ```
-tokens_per_second = DRAM_bandwidth / (model_size_bytes × quantization_factor)
+tokens_per_second = BW_available / (model_size_bytes × (1 - reuse_factor))
 
-Example for Snapdragon 8 Elite:
-  DRAM_bandwidth = 84.8 GB/s
-  model_size (7B, FP4) = 3.5 GB
+Where:
+  BW_available   = DRAM_BW × NPU_allocation_fraction
+                 = 76.8 GB/s × ~0.85  ≈  65 GB/s (after SoC contention)
+  model_size     = 3.5 GB  (7B INT4, bytes per token — not bytes/sec!)
+  reuse_factor   = fraction of weights already in on-chip SRAM (0 ≤ r < 0.013 max)
 
-  tokens/sec ≤ 84.8 / 3.5 ≈ 24 tok/s (absolute hard ceiling)
+Zero-reuse ceiling (conservative):
+  tokens/sec ≤ 65 / 3.5 ≈ 19 tok/s
 
-This is not an optimization opportunity. This is physics.
+With 1% SRAM cache hit:
+  tokens/sec ≤ 65 / (3.5 × 0.99) ≈ 19 tok/s  [negligible improvement]
+
+The ceiling is real. The path to higher throughput is smaller models, not caching 7B weights.
 ```
 
 ### Why "70+ tok/s" Is Theoretically Possible (But Needs Conditions)
@@ -3904,8 +3952,9 @@ Four mechanisms could exceed 24 tok/s:
 **1. Smaller model**
 ```
 1B model, INT4:
-  tokens/sec ≤ 84.8 / 0.5 ≈ 170 tok/s
-This is factually possible. But it's a 7× smaller model.
+  tokens/sec ≤ 76.8 / 0.5 ≈ 154 tok/s (theoretical ceiling)
+  NPU-available BW: ≤ 65 / 0.5 ≈ 130 tok/s (realistic ceiling)
+This is physically plausible. But it's a 7× smaller model with lower capability.
 ```
 
 **2. Caching (on-chip SRAM reuse)**
@@ -3914,11 +3963,29 @@ If you keep some weights in 44 MB of on-chip SRAM:
   - First token: load from DRAM (slow)
   - Subsequent tokens: hit SRAM cache (fast)
 
-Effective bandwidth = (DRAM_bw × fraction_missing + SRAM_bw × fraction_cached)
-If 90% cached:
-  ≈ (84.8 × 0.1 + 10,000 × 0.9) ≈ 9,008 GB/s effective
-  tokens/sec ≈ 9,008 / 3.5 > 2,000 tok/s
-But this only works if the **same weights are reused** (autoregressive tokens with attention patterns that reuse recent context).
+Reality check on caching:
+  On-chip SRAM (all Snapdragon caches combined): ~44 MB
+  7B INT4 model size: 3,500 MB
+  Maximum cacheable fraction: 44 / 3,500 ≈ 1.3%
+
+Correct time-per-token analysis (DRAM remains the bottleneck):
+  Per token, you need 3.5 GB of weight data:
+    SRAM-cached (1.3%):  45.5 MB  at 10,000 GB/s → 0.005 ms  (negligible)
+    DRAM-loaded (98.7%): 3,454 MB at 76.8 GB/s   → 45.0 ms   (bottleneck!)
+
+  Time per token: 45.0 ms vs 45.6 ms (no cache) → tokens/sec ≈ 22.2 tok/s
+  Improvement from 1.3% weight caching: ~1%  ← essentially zero
+
+Why? SRAM is so fast (10 TB/s) that even 1.3% of accesses happen in
+0.005 ms, while DRAM takes 45 ms. You can't hide 45 ms behind 0.005 ms.
+The DRAM is still the bottleneck; it still saturates the 76.8 GB/s channel.
+
+What IS cacheable (and helpful for different reasons):
+  - Attention KV cache: reduces attention computation FLOP count, not weight BW
+  - Hot activation layers: fused microtile kernels keep activations in SRAM,
+    freeing DRAM for the weight stream (net positive for bandwidth budget)
+  - Frequently-accessed embeddings for common tokens (tiny, fits in cache)
+  - NOT: the bulk of weight matrices (3.5 GB >> 44 MB SRAM capacity)
 ```
 
 **3. Prefill burst**
@@ -3940,7 +4007,7 @@ Extreme quantization (binary or ternary weights) could reduce effective model si
 │                                                                 │
 │ (A) Model size < 1.2 GB (≤1B parameters at INT4)               │
 │  OR                                                             │
-│ (B) 90%+ of weights cached on-chip (requires special patterns) │
+│ (B) Weight reuse via micro-tiling (1–5% of weights, not 90%+)  │
 │  OR                                                             │
 │ (C) Both prefill and inference, not pure decode                │
 │                                                                 │
@@ -3958,26 +4025,27 @@ Quantization doesn't just save storage. It fundamentally changes the bandwidth r
 
 ```
 For a 7B parameter LLM during decode:
+[Using 76.8 GB/s theoretical ceiling; NPU-available ~65 GB/s after contention]
 
 FP32 (32 bits per weight):
   Model size = 7B × 4 bytes = 28 GB
-  tokens/sec ≤ 84.8 / 28 ≈ 3 tok/s
+  tokens/sec ≤ 76.8 / 28 ≈ 3 tok/s  [NPU-avail: 65/28 ≈ 2.3 tok/s]
 
 FP16 (16 bits per weight):
   Model size = 7B × 2 bytes = 14 GB
-  tokens/sec ≤ 84.8 / 14 ≈ 6 tok/s
+  tokens/sec ≤ 76.8 / 14 ≈ 5 tok/s  [NPU-avail: 65/14 ≈ 4.6 tok/s]
 
 INT8 (8 bits per weight):
   Model size = 7B × 1 byte = 7 GB
-  tokens/sec ≤ 84.8 / 7 ≈ 12 tok/s
+  tokens/sec ≤ 76.8 / 7 ≈ 11 tok/s  [NPU-avail: 65/7 ≈ 9.3 tok/s]
 
 INT4 (4 bits per weight):
   Model size = 7B × 0.5 bytes = 3.5 GB
-  tokens/sec ≤ 84.8 / 3.5 ≈ 24 tok/s
+  tokens/sec ≤ 76.8 / 3.5 ≈ 22 tok/s [NPU-avail: 65/3.5 ≈ 19 tok/s]
 
 INT2 (2 bits per weight — extreme):
   Model size = 7B × 0.25 bytes = 1.75 GB
-  tokens/sec ≤ 84.8 / 1.75 ≈ 48 tok/s (theoretically)
+  tokens/sec ≤ 76.8 / 1.75 ≈ 44 tok/s (theoretical ceiling only)
   But: 2-bit quantization destroys model accuracy badly
 ```
 
@@ -3996,18 +4064,24 @@ INT2 (2 bits per weight — extreme):
 │   0  ────────────────────────────────────────────────────────│
 │       0   10   20   30   40                                   │
 │       ↑                                                        │
-│   Snapdragon 8 Elite: 84.8 GB/s                              │
-│   (INT4 leaves 60% of BW unused per token!)                  │
+│   Snapdragon 8 Elite: 76.8 GB/s theoretical peak             │
+│   At 22 tok/s: 22 × 3.5 GB/token = 77 GB/s ≈ saturated!    │
 └────────────────────────────────────────────────────────────────┘
 ```
 
 ### Why Snapdragon "Underutilizes" Bandwidth at High Quantization
 
 ```
-Snapdragon LPDDR5X: 84.8 GB/s
-Required for 7B INT4: 3.5 GB/s
+Snapdragon LPDDR5X: ~76.8 GB/s theoretical (NPU-available: ~60–70 GB/s)
+Required for 7B INT4: 3.5 GB/token (not GB/s!)
 
-Utilization: 3.5 / 84.8 = 4.1%
+At 22 tok/s throughput:
+  Bandwidth consumed = 22 tok/s × 3.5 GB/token = 77 GB/s ≈ fully saturated
+  Utilization: 77 / 76.8 ≈ 100%  ← the NPU IS saturating memory bandwidth
+
+At 10 tok/s (thermal throttled):
+  Bandwidth consumed = 10 × 3.5 = 35 GB/s
+  Utilization: 35 / 76.8 ≈ 46%  ← headroom for CPU/ISP traffic
 
 This looks wasteful. But it's actually accurate:
   - Compute is cheap (FP32 multiply ≈ 3.7 pJ)
@@ -4492,7 +4566,22 @@ For LLM inference (which sustains for minutes), you get sustained performance.
 
 ```
 If 70 tok/s is burst performance at 8W:
-  Sustained at 5W: 70 × (5/8) ≈ 44 tok/s
+  Naive linear: 70 × (5/8) ≈ 44 tok/s  ← WRONG assumption
+  
+  Why linear scaling fails:
+    Power = C × V² × f  (dynamic CMOS power)
+    To reduce power by 37.5% (8W→5W), you reduce voltage AND frequency
+    V² × f reduction is nonlinear: halving frequency alone saves ~50% power
+    but the chip doesn't linearly trade power for throughput
+  
+  More realistic scaling at 5W sustained:
+    Clock reduction: ~25–35% (from voltage/frequency curve)
+    Throughput reduction: ~25–35% (assuming BW-bound, scales with clock)
+    Sustained estimate: 70 × 0.68 ≈ 47–48 tok/s (rough upper bound)
+  
+  Additionally: memory bandwidth also scales with NPU clock × memory controller
+  At reduced DRAM frequency, BW ceiling drops proportionally.
+  Sustained real-world is likely 30–50 tok/s, not 44 tok/s.
 
 If 70 tok/s is with all cores (CPU+GPU+NPU):
   But inference mainly uses NPU, which has independent power rail
@@ -4558,7 +4647,9 @@ From NVIDIA's public materials:
 
 - **Multi-die packaging:** Two reticle-limit dies connected by high-bandwidth on-package link
 - **208 billion transistors** total
-- **FP4 native support** via Transformer Engine (halves bytes vs FP8)
+- **FP4 native support** via Transformer Engine (2 bits narrower than FP8;
+  uses on-the-fly dequantization to FP8/FP16 before MAC operations —
+  not simply "half the bytes": requires scaling factors and careful calibration)
 - **HBM3e:** ~8 TB/s per GPU bandwidth
 - **NVLink 5:** 1.8 TB/s bidirectional per GPU for multi-GPU scaling
 - **Dedicated decompression engine**
