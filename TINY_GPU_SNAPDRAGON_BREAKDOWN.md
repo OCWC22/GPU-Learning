@@ -175,18 +175,21 @@ Before we look at any code or any chip, there is one physical truth that dominat
 
 **Moving data costs far more than computing on it.**
 
-This isn't an opinion or a design choice. It's physics. The canonical reference is Horowitz's energy table (originally 45nm, but the ratios hold across nodes):
+This isn't an opinion or a design choice. It's physics. The canonical reference is Horowitz's energy table (originally 45nm CMOS; absolute pJ values shrink at 3nm but the relative ratios remain large because DRAM physics is dominated by off-chip wire capacitance and cell charge dynamics, not transistor size):
 
 ```
-Operation                    Energy (approximate)
-─────────────────────────    ────────────────────
-8-bit integer ADD            ~0.03 pJ
-32-bit float MUL             ~3.7 pJ
-Read 32 bits from SRAM       ~5 pJ
-Read 32 bits from DRAM       ~640 pJ
+Operation                    Energy (approx, 45nm)   At 3nm (est.)
+─────────────────────────    ────────────────────    ─────────────
+8-bit integer ADD            ~0.03 pJ                ~0.003 pJ
+32-bit float MUL             ~3.7 pJ                 ~0.5–1 pJ
+Read 32 bits from SRAM       ~5 pJ                   ~0.5–1 pJ
+Read 32 bits from DRAM       ~640 pJ                 ~100–200 pJ
 
-DRAM read is ~170× more expensive than a 32-bit float multiply.
-DRAM read is ~128× more expensive than an SRAM read.
+At 3nm, compute and SRAM costs drop ~5–10× (voltage scaling, shorter wires).
+DRAM cost drops less (~3–6×) because off-chip IO capacitance dominates.
+Net ratio at 3nm: DRAM still ~100–400× more expensive than arithmetic.
+The qualitative lesson — DRAM is catastrophically expensive — remains true
+at every process node. The 170× figure is illustrative; the principle is invariant.
 ```
 
 This means: **the entire purpose of GPU/NPU architecture is to avoid going to DRAM.** Every cache, every coalescing unit, every tiling strategy, every compression engine exists because of this energy gap. The ALUs are almost free by comparison.
@@ -239,18 +242,24 @@ Performance (ops/sec)
 - **Low intensity** (left side): You fetch lots of data but do little math per byte. You're **bandwidth-limited**. Adding more ALUs won't help.
 - **High intensity** (right side): You do lots of math per byte fetched. You're **compute-limited**. Adding more bandwidth won't help.
 
-**LLM decode (generating tokens one at a time) is almost always on the left side — bandwidth-limited.** Each token requires reading most of the model's weights, but each weight participates in only one multiply-accumulate. The operational intensity is roughly:
+**LLM decode (generating tokens one at a time) is almost always on the left side — bandwidth-limited.** In the batch=1 dense case, each token requires streaming each layer's weight matrix once — and with no cross-token reuse, the weights must be re-fetched from DRAM every token. Modern engines reduce this through layer-by-layer tiling, kernel fusion, and KV cache management, but the fundamental per-token weight-read requirement remains. The operational intensity is roughly:
 
 ```
-For dense decode at batch=1:
+For dense decode at batch=1 (no persistent weight tiling):
   Operations per token: ~2 × parameter_count (one multiply + one accumulate per weight)
   Bytes read per token: ~parameter_count × bytes_per_weight
+    + KV cache reads   (grows with context length: 2 × layers × heads × head_dim × seq_len)
+    + dequant scaling  (scale factors per quantization group)
 
-  Operational intensity ≈ 2 ops / bytes_per_weight
+  Weight-only operational intensity ≈ 2 ops / bytes_per_weight
+  Total intensity (including KV + aux) is lower, especially at long context
 
-  At INT4 (0.5 bytes per weight): intensity ≈ 4 ops/byte
-  At INT8 (1 byte per weight):    intensity ≈ 2 ops/byte
-  At FP16 (2 bytes per weight):   intensity ≈ 1 op/byte
+  At INT4 (0.5 bytes per weight): weight intensity ≈ 4 ops/byte
+  At INT8 (1 byte per weight):    weight intensity ≈ 2 ops/byte
+  At FP16 (2 bytes per weight):   weight intensity ≈ 1 op/byte
+
+  Note: At long context (e.g. 32K tokens), KV cache reads can rival
+  weight reads in total bytes, pushing effective AI below these values.
 ```
 
 ### Concrete Roofline Example
@@ -3759,8 +3768,17 @@ NVIDIA B200:
 │  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│ HBM
 │  ████████████████████████████████████ (×312 in decode)│ Need│
 └─────────────────────────────────────────────────────────────┘
-HBM's 100× bandwidth advantage means B200 reaches compute-limited
-prefill at AI ≥ 312 FLOPS/byte. Both chips require on-chip reuse.
+HBM's 100× bandwidth advantage means B200 can approach compute-limited
+behavior in large-batch prefill when AI ≥ ~312 FLOPS/byte.
+
+In practice, real transformer kernels are partially compute-bound:
+  - Layernorm, softmax, elementwise ops have much lower AI
+  - KV cache writes add bandwidth pressure during prefill
+  - Tiling imperfections leave some compute cycles idle
+  - Memory pipeline overlap is never 100%
+→ B200 prefill is "significantly less bandwidth-bound than decode"
+  but rarely hits pure compute saturation on full transformer graphs.
+Both chips require on-chip reuse; HBM narrows the gap dramatically.
 ```
 
 ### Hardware Face-Off: Same Physics, Different Budgets
@@ -3807,6 +3825,25 @@ Qualcomm describes "Micro Tile Inferencing" — reducing intermediate activation
 > "Microtile inferencing breaks networks into microtiles executed independently and can eliminate memory traffic between as many as 10 or more layers."
 
 This primarily targets **activation bandwidth**, not the fundamental need to consume weights. It frees external bandwidth for the weight stream.
+
+The mechanism for throughput improvement is **intra-tile arithmetic intensity**, not percentage of model cached:
+
+```
+Standard layer-by-layer (no fusion):
+  For each layer: load weights → compute → write activations to DRAM → load next
+  Activation DRAM traffic: O(seq_len × hidden_dim) per layer boundary
+  Weight AI: ~2 FLOPS/byte (still bandwidth-bound for weights)
+
+Micro-tiled fusion (fuse 10+ layers):
+  Load weights for fused block → keep activations in SRAM → compute all layers → write only final output
+  Activation DRAM traffic: reduced by ~10× for fused region
+  Weight AI: still ~2 FLOPS/byte per weight byte (weights must still be read)
+  Net effect: DRAM bandwidth freed for weight stream + reduced total traffic
+
+Key insight: Micro-tiling raises effective compute-per-DRAM-byte by eliminating
+activation round-trips. It does NOT reduce weight bandwidth; it uses freed BW
+capacity to accommodate the weight stream more efficiently.
+```
 
 ### Core Stalls → Solved by Wave Scheduling / Systolic Dataflow
 
@@ -4007,7 +4044,7 @@ Extreme quantization (binary or ternary weights) could reduce effective model si
 │                                                                 │
 │ (A) Model size < 1.2 GB (≤1B parameters at INT4)               │
 │  OR                                                             │
-│ (B) Weight reuse via micro-tiling (1–5% of weights, not 90%+)  │
+│ (B) Intra-tile weight reuse (higher AI within each SRAM tile)   │
 │  OR                                                             │
 │ (C) Both prefill and inference, not pure decode                │
 │                                                                 │
@@ -4064,8 +4101,9 @@ INT2 (2 bits per weight — extreme):
 │   0  ────────────────────────────────────────────────────────│
 │       0   10   20   30   40                                   │
 │       ↑                                                        │
-│   Snapdragon 8 Elite: 76.8 GB/s theoretical peak             │
-│   At 22 tok/s: 22 × 3.5 GB/token = 77 GB/s ≈ saturated!    │
+│   Snapdragon 8 Elite: 76.8 GB/s theoretical / ~60–70 GB/s sustained │
+│   At 22 tok/s: 22 × 3.5 GB/token = 77 GB/s ≈ at or beyond sustained│
+│   (real LPDDR sustained BW ~60–70 GB/s after refresh + overhead)    │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -4076,8 +4114,14 @@ Snapdragon LPDDR5X: ~76.8 GB/s theoretical (NPU-available: ~60–70 GB/s)
 Required for 7B INT4: 3.5 GB/token (not GB/s!)
 
 At 22 tok/s throughput:
-  Bandwidth consumed = 22 tok/s × 3.5 GB/token = 77 GB/s ≈ fully saturated
-  Utilization: 77 / 76.8 ≈ 100%  ← the NPU IS saturating memory bandwidth
+  Bandwidth consumed = 22 tok/s × 3.5 GB/token = 77 GB/s
+  vs. theoretical peak:  76.8 GB/s  → already at or beyond theoretical peak
+  vs. sustained reality: ~60–70 GB/s (LPDDR5X loses ~10–15% to refresh
+    cycles, command overhead, and rank interleave inefficiency under load)
+
+  This means 22 tok/s requires near-ideal LPDDR streaming conditions:
+  minimal page conflicts, sustained burst mode, no SoC contention spikes.
+  Real-world sustained decode is more likely 16–20 tok/s for a 7B INT4 model.
 
 At 10 tok/s (thermal throttled):
   Bandwidth consumed = 10 × 3.5 = 35 GB/s
