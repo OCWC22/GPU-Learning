@@ -178,18 +178,25 @@ Before we look at any code or any chip, there is one physical truth that dominat
 This isn't an opinion or a design choice. It's physics. The canonical reference is Horowitz's energy table (originally 45nm CMOS; absolute pJ values shrink at 3nm but the relative ratios remain large because DRAM physics is dominated by off-chip wire capacitance and cell charge dynamics, not transistor size):
 
 ```
-Operation                    Energy (approx, 45nm)   At 3nm (est.)
-─────────────────────────    ────────────────────    ─────────────
-8-bit integer ADD            ~0.03 pJ                ~0.003 pJ
-32-bit float MUL             ~3.7 pJ                 ~0.5–1 pJ
-Read 32 bits from SRAM       ~5 pJ                   ~0.5–1 pJ
-Read 32 bits from DRAM       ~640 pJ                 ~100–200 pJ
+Operation                    Energy (approx, 45nm)   At 3nm [⚠ est.]
+─────────────────────────    ────────────────────    ──────────────────
+8-bit integer ADD            ~0.03 pJ                ~0.003–0.01 pJ
+32-bit float MUL             ~3.7 pJ                 ~0.4–1.5 pJ
+Read 32 bits from SRAM       ~5 pJ                   ~0.5–2 pJ
+Read 32 bits from DRAM       ~640 pJ [*]             ~100–300 pJ
 
-At 3nm, compute and SRAM costs drop ~5–10× (voltage scaling, shorter wires).
-DRAM cost drops less (~3–6×) because off-chip IO capacitance dominates.
-Net ratio at 3nm: DRAM still ~100–400× more expensive than arithmetic.
-The qualitative lesson — DRAM is catastrophically expensive — remains true
-at every process node. The 170× figure is illustrative; the principle is invariant.
+[*] Some Horowitz sources quote DRAM at 1.3–2.6 nJ per access (access-width
+    and protocol dependent). The 640 pJ figure is a widely-used paraphrase
+    for 32-bit access. Either framing gives a ratio of ~100–400× vs compute.
+
+[⚠ 3nm column = rough order-of-magnitude thought experiment, NOT canonical.
+   Based on: voltage scaling (V²f → ~4–10× compute savings), shorter on-die
+   wires (~2–5× SRAM savings), but DRAM off-chip IO capacitance scales poorly
+   (~3–5× savings at best). No peer-reviewed measurement cited.]
+
+At 3nm: DRAM is still ~100–300× more expensive than arithmetic (estimated).
+The qualitative lesson — DRAM is catastrophically expensive — holds at
+every node. The 170× Horowitz ratio is illustrative; the principle is invariant.
 ```
 
 This means: **the entire purpose of GPU/NPU architecture is to avoid going to DRAM.** Every cache, every coalescing unit, every tiling strategy, every compression engine exists because of this energy gap. The ALUs are almost free by comparison.
@@ -1760,8 +1767,9 @@ A **Snapdragon SoC** (System on Chip) is an entire computer on one chip:
 │  │         shared across CPU · GPU · NPU · ISP · modem          │ │
 │  └──────────────────────────────────────────────────────────────┘ │
 │  ┌──────────────────────────────────────────────────────────────┐ │
-│  │           LPDDR5X Memory Controller — 84.8 GB/s              │ │
-│  │           4 channels × 16-bit = 64-bit bus                   │ │
+│  │  LPDDR5X Memory Controller — vendor spec: ~84.8 GB/s         │ │
+│  │  (derived: 4ch × 16-bit × 9600 MT/s ÷ 8 = 76.8 GB/s peak)   │ │
+│  │  4 channels × 16-bit = 64-bit total bus width                 │ │
 │  └──────────────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -1805,7 +1813,8 @@ The GPU is just **one block** on this chip. It shares the memory controller with
 │  └──────────────────────┬───────────────────────────────────────────────┘   │
 │                         │                                                    │
 │  ┌──────────────────────▼──────────────────────────────────────────────┐    │
-│  │    LPDDR5X Memory Controller — 4 channels, ~84.8 GB/s peak          │    │
+│  │    LPDDR5X Memory Controller — 4 channels                            │    │
+│  │  • Vendor spec: ~84.8 GB/s  |  Derived: 76.8 GB/s (9600 MT/s × 8B)  │    │
 │  │  • Channel 0-3: each 16-bit × 9600 MT/s                             │    │
 │  │  • Prioritizes real-time consumers (display, ISP)                    │    │
 │  │  • Remaining bandwidth shared among CPU/GPU/NPU                      │    │
@@ -1994,7 +2003,9 @@ tiny-gpu                              Adreno 830
 ────────                              ──────────
 NUM_CORES = 2                    →    3 slices × 4 CU = 12 Compute Units
 THREADS_PER_BLOCK = 4            →    Waves of 64 fibers, 1000s per CU
-DATA_MEM_NUM_CHANNELS = 4        →    4 LPDDR5X channels, 84.8 GB/s peak
+DATA_MEM_NUM_CHANNELS = 4        →    4 LPDDR5X channels
+                                       derived: 76.8 GB/s (4ch × 16-bit × 9600 MT/s ÷ 8)
+                                       vendor spec: ~84.8 GB/s (Qualcomm marketing)
 PROGRAM_MEM_NUM_CHANNELS = 1     →    Per-CU instruction cache hierarchy
 DATA_MEM_ADDR_BITS = 8 (256)     →    36+ bit address space (12 GB)
 DATA_MEM_DATA_BITS = 8           →    32-bit (FP32) or 16-bit (FP16) native
@@ -2345,7 +2356,9 @@ Example: Load A[i] from address 0:
              │ 1 transaction to DRAM (if SLC miss)
              ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│              LPDDR5X DRAM — 4 channels, ~84.8 GB/s                      │
+│     LPDDR5X DRAM — 4 channels                                           │
+│     Derived peak: 76.8 GB/s  |  Vendor spec: ~84.8 GB/s                 │
+│     Typical sustained: ~70–90% of peak (workload-dependent)             │
 │  • Latency: 60–200+ ns depending on access pattern:                    │
 │      Page hit (tCL + tRCD ≈ 18ns each): ~60–80 ns                     │
 │      Page miss (add tRP precharge):      ~80–120 ns                    │
@@ -3350,9 +3363,9 @@ Naive case (no caching, no reuse):
   Weights read per token: ~3.5 GB (all of them)
   At 70 tokens/second: 3.5 GB × 70 = 245 GB/s required
 
-  LPDDR5X peak bandwidth: ~84.8 GB/s
+  LPDDR5X derived peak: 76.8 GB/s  |  vendor spec: ~84.8 GB/s
 
-  245 GB/s >> 84.8 GB/s
+  245 GB/s >> 76.8 GB/s
 
   THIS DOESN'T WORK.
 ```
@@ -3740,12 +3753,12 @@ For 70B model at FP4:
 │  Required feed = compute / arithmetic_intensity (AI):       │
 │    required_BW = 75 TOPS ÷ AI                               │
 │                                                             │
-│  Decode  (batch=1, AI ≈ 1–4 FLOPS/byte):                  │
-│    75 TOPS ÷ 2 FLOPS/byte ≈ 37 TB/s >> DRAM (0.085 TB/s)  │
+│  Decode  (batch=1, AI ≈ 1–4 ops/byte for INT8/INT4):      │
+│    75 TOPS ÷ 2 ops/byte ≈ 37 TB/s >> DRAM (0.085 TB/s)    │
 │    Gap: 37 / 0.085 ≈ 435×  → severely bandwidth-bound      │
 │                                                             │
-│  Prefill (tiled GEMM, AI ≈ 100–500 FLOPS/byte):            │
-│    75 TOPS ÷ 300 FLOPS/byte ≈ 0.25 TB/s > DRAM            │
+│  Prefill (tiled GEMM, AI ≈ 100–500 FLOPS/byte for FP16):  │
+│    75 TOPS ÷ 300 ops/byte ≈ 0.25 TB/s > DRAM              │
 │    Gap: 0.25 / 0.085 ≈ 3×  → approaching compute-limited   │
 │                                                             │
 │  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│ DRAM
@@ -3756,20 +3769,31 @@ For 70B model at FP4:
 
 NVIDIA B200:
 ┌─────────────────────────────────────────────────────────────┐
-│  Peak compute:              ~2,500 TOPS FP8                 │
+│  Peak compute (precision-dependent):                        │
+│    TF32:  ~2,200 TOPS  (HGX B200, confirmed spec)          │
+│    FP8:   ~4,500 TOPS dense  (HGX B200)                    │
+│    FP4:   ~9,000 TOPS dense  (with Transformer Engine)     │
+│  HBM3e:   7.7 TB/s (HGX B200) / 8.0 TB/s (full B200)     │
 │                                                             │
-│  Required feed = 2,500 TOPS ÷ AI:                          │
-│    Decode  (AI ≈ 1–4):  625–2,500 TB/s  >> HBM (8 TB/s)   │
-│    Prefill (AI ≈ 1000): 2.5 TB/s        <  HBM (8 TB/s) ✓ │
+│  Required feed = compute ÷ AI:                              │
+│    Decode  (AI ≈ 1–4 ops/byte):  wide range >> HBM         │
+│    Prefill FP8 (AI ≈ 500+):      may approach HBM capacity  │
 │                                                             │
-│  Decode gap:    2,500 TB/s needed / 8 TB/s HBM = 312×      │
-│  Prefill gap:   2.5 TB/s needed / 8 TB/s HBM < 1× ← WIN   │
+│  AI knee (TF32, HGX B200): 2,200 TOPS ÷ 7,700 GB/s ≈ 286 ops/byte │
+│  AI knee (FP8, B200):      4,500 TOPS ÷ 7,700 GB/s ≈ 584 ops/byte │
+│  → "compute-limited" threshold depends on precision mode    │
 │                                                             │
 │  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│ HBM
 │  ████████████████████████████████████ (×312 in decode)│ Need│
 └─────────────────────────────────────────────────────────────┘
 HBM's 100× bandwidth advantage means B200 can approach compute-limited
-behavior in large-batch prefill when AI ≥ ~312 FLOPS/byte.
+behavior in large-batch prefill. The AI knee depends on precision mode
+and platform:
+  HGX B200 TF32:  ~2,200 TOPS ÷ 7,700 GB/s  ≈ 286 ops/byte
+  HGX B200 FP8:   ~4,500 TOPS ÷ 7,700 GB/s  ≈ 584 ops/byte
+  (Full B200 at 8 TB/s shifts these by ~4%)
+These are theoretical roofline knees; real kernels reach them only in
+large-batch, well-tiled GEMMs — not on full transformer graphs.
 
 In practice, real transformer kernels are partially compute-bound:
   - Layernorm, softmax, elementwise ops have much lower AI
@@ -3832,17 +3856,29 @@ The mechanism for throughput improvement is **intra-tile arithmetic intensity**,
 Standard layer-by-layer (no fusion):
   For each layer: load weights → compute → write activations to DRAM → load next
   Activation DRAM traffic: O(seq_len × hidden_dim) per layer boundary
-  Weight AI: ~2 FLOPS/byte (still bandwidth-bound for weights)
+  Weight ops/byte: precision-dependent
+    INT8 weights (1 B/weight): ~2 ops/byte (1 MAC per byte)
+    INT4 weights (0.5 B/weight): ~4 ops/byte (1 MAC per 0.5 bytes)
+  Still bandwidth-bound for weights at either precision.
 
 Micro-tiled fusion (fuse 10+ layers):
   Load weights for fused block → keep activations in SRAM → compute all layers → write only final output
   Activation DRAM traffic: reduced by ~10× for fused region
-  Weight AI: still ~2 FLOPS/byte per weight byte (weights must still be read)
+  Weight ops/byte: same precision-dependent values (weights must still be read)
   Net effect: DRAM bandwidth freed for weight stream + reduced total traffic
 
 Key insight: Micro-tiling raises effective compute-per-DRAM-byte by eliminating
-activation round-trips. It does NOT reduce weight bandwidth; it uses freed BW
-capacity to accommodate the weight stream more efficiently.
+activation round-trips within a fused kernel group. It does NOT reduce weight
+bandwidth; it uses freed BW capacity for the weight stream.
+
+Constraints on how much fusion is possible:
+  - SRAM capacity: intermediate activations must fit in on-chip memory
+    (e.g., 44 MB limits how many layers can be fused at a given batch size)
+  - Operator graph topology: only elementwise + matmul sequences fuse cleanly;
+    reductions, softmax, and layernorm break simple fusion chains
+  - Scheduling overhead: each fused kernel needs a tiled execution plan
+  - The Qualcomm "10 or more layers" claim is for specific network topologies
+    (e.g., linear MLP stacks), not a general guarantee for all transformers.
 ```
 
 ### Core Stalls → Solved by Wave Scheduling / Systolic Dataflow
@@ -3917,10 +3953,12 @@ Weight load for 6-token prefill on 7B model:
 Operational Intensity (FLOP/byte):
   matmul([batch=6, seq_len=1, dim=4096], [dim=4096, d_ff=11008])
   = 2 × 6 × 1 × 4096 × 11008 FLOPS ÷ (6 × 4096 × 4 bytes)
-  ≈ 2 × 11008 / 4 ≈ 5,500 FLOPS/byte  ← compute-limited at this batch size
-  [NOTE: This 5,500 FLOPS/byte assumes batch=6 and ignores KV cache bandwidth.
-   Actual AI depends on seq_len, batch_size, hidden_dim, and SRAM reuse depth.
-   At batch=1, AI ≈ 1–4 FLOPS/byte (bandwidth-bound, like decode).]
+  ≈ 2 × 11008 / 4 ≈ 5,500 FLOPS/byte  (FP16/BF16 matmul — FLOPS is correct here)
+  [NOTE: This assumes batch=6, FP16, and ignores KV cache bandwidth.
+   Actual AI depends on seq_len, batch_size, hidden_dim, SRAM reuse depth,
+   and precision. For INT8/INT4 decode (batch=1), use ops/byte not FLOPS/byte;
+   that value is ~1–4 ops/byte (bandwidth-bound). FP16 prefill with large
+   batch can legitimately hit thousands of FLOPS/byte.]
 ```
 
 **Prefill can run at peak compute efficiency** because you're amortizing weights across multiple tokens. This is essentially a tiled matrix-matrix multiply (GEMM).
@@ -3968,8 +4006,9 @@ For decode, the ceiling is **hard physics**:
 tokens_per_second = BW_available / (model_size_bytes × (1 - reuse_factor))
 
 Where:
-  BW_available   = DRAM_BW × NPU_allocation_fraction
-                 = 76.8 GB/s × ~0.85  ≈  65 GB/s (after SoC contention)
+  BW_available   = DRAM_BW × NPU_allocation_fraction × efficiency
+                 = 76.8 GB/s × ~0.85 (SoC share) × ~0.85 (LPDDR efficiency)
+                 ≈ 55 GB/s  [rough estimate; real value is workload-dependent]
   model_size     = 3.5 GB  (7B INT4, bytes per token — not bytes/sec!)
   reuse_factor   = fraction of weights already in on-chip SRAM (0 ≤ r < 0.013 max)
 
@@ -4101,7 +4140,7 @@ INT2 (2 bits per weight — extreme):
 │   0  ────────────────────────────────────────────────────────│
 │       0   10   20   30   40                                   │
 │       ↑                                                        │
-│   Snapdragon 8 Elite: 76.8 GB/s theoretical / ~60–70 GB/s sustained │
+│   Snapdragon 8 Elite: 76.8 GB/s theoretical / ~54–69 GB/s estimated sustained (~70–90% of 76.8 GB/s theoretical) │
 │   At 22 tok/s: 22 × 3.5 GB/token = 77 GB/s ≈ at or beyond sustained│
 │   (real LPDDR sustained BW ~60–70 GB/s after refresh + overhead)    │
 └────────────────────────────────────────────────────────────────┘
@@ -4116,12 +4155,16 @@ Required for 7B INT4: 3.5 GB/token (not GB/s!)
 At 22 tok/s throughput:
   Bandwidth consumed = 22 tok/s × 3.5 GB/token = 77 GB/s
   vs. theoretical peak:  76.8 GB/s  → already at or beyond theoretical peak
-  vs. sustained reality: ~60–70 GB/s (LPDDR5X loses ~10–15% to refresh
-    cycles, command overhead, and rank interleave inefficiency under load)
+  vs. estimated sustained: ~54–69 GB/s  [70–90% efficiency is a defensible
+    generic range for LPDDR under load; exact value is workload-dependent
+    and not publicly measured for Snapdragon 8 Elite inference workloads.]
+    Sources of efficiency loss: DRAM refresh, command overhead, rank-switching,
+    page-mode misses, and SoC arbitration contention.
 
-  This means 22 tok/s requires near-ideal LPDDR streaming conditions:
-  minimal page conflicts, sustained burst mode, no SoC contention spikes.
-  Real-world sustained decode is more likely 16–20 tok/s for a 7B INT4 model.
+  22 tok/s therefore requires near-ideal streaming conditions: sustained
+  burst mode, minimal page conflicts, low SoC contention. The likely
+  real-world sustained decode range is 16–22 tok/s for a 7B INT4 model
+  (lower bound = heavy contention; upper = near-ideal NPU-priority streaming).
 
 At 10 tok/s (thermal throttled):
   Bandwidth consumed = 10 × 3.5 = 35 GB/s
